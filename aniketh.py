@@ -1,140 +1,236 @@
+import io
+from typing import List, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
 import streamlit as st
-import math
-from scipy.stats import fisher_exact, chi2, f, t
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    RocCurveDisplay,
+    accuracy_score,
+    classification_report,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# Function to calculate binomial coefficient
-def binomial_coefficient(n, k):
-    return math.comb(n, k)
+st.set_page_config(page_title="Banking Churn Management", layout="wide")
 
-# Function to calculate factorial
-def factorial(n):
-    return math.factorial(n)
+SAMPLE_DATA_PATH = "data/sample_churn_data.csv"
 
-# Function to calculate the probability P for a 2x2 table (Fisher Exact Test)
-def calculate_2x2_fisher(a, b, c, d):
-    _, p_value = fisher_exact([[a, b], [c, d]], alternative="two-sided")
-    return p_value
 
-# Function to calculate the probability P for a 3x2 or 4x2 table (Fisher Exact Test approximation)
-def calculate_fisher_for_larger_tables(table):
-    row_totals = [sum(row) for row in table]
-    col_totals = [sum(col) for col in zip(*table)]
-    n = sum(row_totals)
+@st.cache_data
+def load_sample_data() -> pd.DataFrame:
+    return pd.read_csv(SAMPLE_DATA_PATH)
 
-    numerator = 1
-    for i in range(len(row_totals)):
-        numerator *= factorial(row_totals[i])
-    for j in range(len(col_totals)):
-        numerator *= factorial(col_totals[j])
-    
-    denominator = factorial(n)
-    for i in range(len(table)):
-        for j in range(len(table[i])):
-            denominator *= factorial(table[i][j])
-    
-    p_value = numerator / denominator
-    return p_value  # This is an approximation; for exact p-value use external libraries.
 
-# Function to calculate Chi-square test
-def calculate_chi_square(table):
-    row_totals = [sum(row) for row in table]
-    col_totals = [sum(col) for col in zip(*table)]
-    n = sum(row_totals)
+@st.cache_data
+def load_uploaded_data(file: io.BytesIO) -> pd.DataFrame:
+    return pd.read_csv(file)
 
-    expected = [[(row_total * col_total) / n for col_total in col_totals] for row_total in row_totals]
-    chi2_stat = sum(((table[i][j] - expected[i][j]) ** 2) / expected[i][j] for i in range(len(table)) for j in range(len(table[0])))
-    p_value = chi2.sf(chi2_stat, (len(row_totals) - 1) * (len(col_totals) - 1))
-    return chi2_stat, p_value
 
-# Function to calculate ANOVA
-def calculate_anova_from_table(table):
-    flattened_table = [item for row in table for item in row]
-    overall_mean = sum(flattened_table) / len(flattened_table)
+def resolve_target(series: pd.Series) -> Tuple[pd.Series, str]:
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype(int), "numeric"
+    unique_values = list(series.dropna().unique())
+    if len(unique_values) == 2:
+        mapping = {unique_values[0]: 0, unique_values[1]: 1}
+        return series.map(mapping).astype(int), "mapped"
+    return series, "unsupported"
 
-    group_means = [sum(row) / len(row) for row in table]
-    between_group_sum_of_squares = sum(len(row) * (group_mean - overall_mean) ** 2 for row, group_mean in zip(table, group_means))
-    within_group_sum_of_squares = sum(sum((x - group_mean) ** 2 for x in row) for row, group_mean in zip(table, group_means))
 
-    df_between = len(table) - 1
-    df_within = len(flattened_table) - len(table)
-    
-    mean_square_between = between_group_sum_of_squares / df_between
-    mean_square_within = within_group_sum_of_squares / df_within
+def build_preprocessor(
+    df: pd.DataFrame, drop_columns: List[str]
+) -> Tuple[ColumnTransformer, List[str], List[str]]:
+    feature_df = df.drop(columns=drop_columns)
+    numeric_features = feature_df.select_dtypes(include=["number"]).columns.tolist()
+    categorical_features = [
+        col for col in feature_df.columns if col not in numeric_features
+    ]
 
-    f_stat = mean_square_between / mean_square_within
-    p_value = f.sf(f_stat, df_between, df_within)
-    return f_stat, p_value
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "onehot",
+                OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+            ),
+        ]
+    )
 
-# Function to calculate T-test
-def calculate_t_test_from_table(table):
-    group1 = table[0]
-    group2 = table[1] if len(table) > 1 else []
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, numeric_features),
+            ("cat", categorical_pipeline, categorical_features),
+        ],
+        remainder="drop",
+    )
+    return preprocessor, numeric_features, categorical_features
 
-    mean1 = sum(group1) / len(group1)
-    mean2 = sum(group2) / len(group2)
-    var1 = sum((x - mean1) ** 2 for x in group1) / (len(group1) - 1)
-    var2 = sum((x - mean2) ** 2 for x in group2) / (len(group2) - 1)
-    n1, n2 = len(group1), len(group2)
 
-    pooled_variance = ((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2)
-    t_stat = (mean1 - mean2) / math.sqrt(pooled_variance * (1/n1 + 1/n2))
-    p_value = 2 * t.sf(abs(t_stat), df=n1 + n2 - 2)
-    return t_stat, p_value
+def get_feature_names(
+    preprocessor: ColumnTransformer,
+    numeric_features: List[str],
+    categorical_features: List[str],
+) -> List[str]:
+    feature_names = list(numeric_features)
+    if categorical_features:
+        encoder = preprocessor.named_transformers_["cat"].named_steps["onehot"]
+        encoded_names = encoder.get_feature_names_out(categorical_features).tolist()
+        feature_names.extend(encoded_names)
+    return feature_names
 
-# Function to interpret results
-def interpret_results(p_value, alpha=0.05):
-    if p_value < alpha:
-        st.success("Reject the null hypothesis. There is a significant difference between the groups.")
-    else:
-        st.info("Fail to reject the null hypothesis. There is no significant difference between the groups.")
 
-# Streamlit app
-test_type = st.sidebar.selectbox("Select the test to perform:", ["Fisher Exact Test", "Chi-square Test", "ANOVA", "T-test"])
-st.title(f"{test_type} Calculator")
+st.title("Banking Churn Management Dashboard")
 
-# Matrix size selection
-matrix_size = st.selectbox("Select matrix size:", ["2x2", "3x2", "4x2"])
+st.sidebar.header("Data Source")
+uploaded_file = st.sidebar.file_uploader("Upload churn data (CSV)", type=["csv"])
 
-# Get the input values based on the matrix size
-if matrix_size == "2x2":
-    a = st.number_input("Enter value for a:", min_value=0, value=10)
-    b = st.number_input("Enter value for b:", min_value=0, value=2)
-    c = st.number_input("Enter value for c:", min_value=0, value=3)
-    d = st.number_input("Enter value for d:", min_value=0, value=8)
-    table = [[a, b], [c, d]]
+sample_data = load_sample_data()
 
-elif matrix_size == "3x2":
-    table = [[st.number_input(f"Group {i+1}, Outcome {j+1}:", min_value=0, value=1) for j in range(2)] for i in range(3)]
+with open(SAMPLE_DATA_PATH, "rb") as sample_file:
+    st.sidebar.download_button(
+        label="Download sample data",
+        data=sample_file,
+        file_name="sample_churn_data.csv",
+        mime="text/csv",
+    )
 
-elif matrix_size == "4x2":
-    table = [[st.number_input(f"Group {i+1}, Outcome {j+1}:", min_value=0, value=1) for j in range(2)] for i in range(4)]
+if uploaded_file is not None:
+    data = load_uploaded_data(uploaded_file)
+    st.sidebar.success("Using uploaded data")
+else:
+    data = sample_data.copy()
+    st.sidebar.info("Using bundled sample data")
 
-# Perform the selected test
-if test_type == "Fisher Exact Test":
-    if matrix_size == "2x2":
-        p_value = calculate_2x2_fisher(a, b, c, d)
-    else:
-        p_value = calculate_fisher_for_larger_tables(table)
-    st.write(f"The calculated p-value for the {matrix_size} table is:", p_value)
-    interpret_results(p_value)
+st.subheader("Data Preview")
+st.dataframe(data.head(20), use_container_width=True)
 
-elif test_type == "Chi-square Test":
-    chi2_stat, p_value = calculate_chi_square(table)
-    st.write(f"Chi-square statistic: {chi2_stat}")
-    st.write(f"p-value: {p_value}")
-    interpret_results(p_value)
+st.sidebar.header("Model Settings")
+default_target = "churn" if "churn" in data.columns else data.columns[-1]
+target_column = st.sidebar.selectbox("Target column", data.columns, index=data.columns.get_loc(default_target))
 
-elif test_type == "ANOVA":
-    f_stat, p_value = calculate_anova_from_table(table)
-    st.write(f"F-statistic: {f_stat}")
-    st.write(f"p-value: {p_value}")
-    interpret_results(p_value)
+suggested_drop = [col for col in data.columns if "id" in col.lower() and col != target_column]
+drop_columns = st.sidebar.multiselect(
+    "Columns to drop", [col for col in data.columns if col != target_column], default=suggested_drop
+)
 
-elif test_type == "T-test":
-    if len(table) > 1:
-        t_stat, p_value = calculate_t_test_from_table(table)
-        st.write(f"T-test statistic: {t_stat}")
-        st.write(f"p-value: {p_value}")
-        interpret_results(p_value)
-    else:
-        st.write("T-test requires at least two groups.")
+n_estimators = st.sidebar.slider("Random forest trees", min_value=50, max_value=300, value=150, step=25)
+max_depth = st.sidebar.slider("Max depth", min_value=3, max_value=15, value=6, step=1)
+
+test_size = st.sidebar.slider("Test size", min_value=0.2, max_value=0.4, value=0.25, step=0.05)
+
+if target_column in drop_columns:
+    st.warning("Target column cannot be dropped. It has been removed from drop list.")
+    drop_columns = [col for col in drop_columns if col != target_column]
+
+if target_column not in data.columns:
+    st.error("Target column missing from data. Please select a valid column.")
+    st.stop()
+
+target_series, target_mode = resolve_target(data[target_column])
+if target_mode == "unsupported":
+    st.error("Target column must be binary. Please upload data with a binary churn label.")
+    st.stop()
+
+feature_data = data.drop(columns=[target_column])
+feature_data = feature_data.drop(columns=drop_columns)
+
+if feature_data.empty:
+    st.error("No features left after dropping columns. Please adjust selections.")
+    st.stop()
+
+preprocessor, numeric_features, categorical_features = build_preprocessor(
+    feature_data, drop_columns=[]
+)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    feature_data, target_series, test_size=test_size, random_state=42, stratify=target_series
+)
+
+X_train_processed = preprocessor.fit_transform(X_train)
+X_test_processed = preprocessor.transform(X_test)
+
+model = RandomForestClassifier(
+    n_estimators=n_estimators,
+    max_depth=max_depth,
+    random_state=42,
+    class_weight="balanced",
+)
+model.fit(X_train_processed, y_train)
+
+y_pred = model.predict(X_test_processed)
+proba = model.predict_proba(X_test_processed)[:, 1]
+
+st.subheader("Model Performance Metrics")
+metric_cols = st.columns(5)
+metric_cols[0].metric("Accuracy", f"{accuracy_score(y_test, y_pred):.3f}")
+metric_cols[1].metric("Precision", f"{precision_score(y_test, y_pred):.3f}")
+metric_cols[2].metric("Recall", f"{recall_score(y_test, y_pred):.3f}")
+metric_cols[3].metric("F1", f"{f1_score(y_test, y_pred):.3f}")
+metric_cols[4].metric("ROC AUC", f"{roc_auc_score(y_test, proba):.3f}")
+
+st.markdown("**Classification Report**")
+st.code(classification_report(y_test, y_pred), language="text")
+
+plot_cols = st.columns(2)
+with plot_cols[0]:
+    st.markdown("**Confusion Matrix**")
+    fig_cm, ax_cm = plt.subplots()
+    ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax_cm, cmap="Blues")
+    st.pyplot(fig_cm)
+    plt.close(fig_cm)
+
+with plot_cols[1]:
+    st.markdown("**ROC Curve**")
+    fig_roc, ax_roc = plt.subplots()
+    RocCurveDisplay.from_predictions(y_test, proba, ax=ax_roc)
+    st.pyplot(fig_roc)
+    plt.close(fig_roc)
+
+st.subheader("SHAP Explanations")
+feature_names = get_feature_names(preprocessor, numeric_features, categorical_features)
+
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test_processed)
+shap_class1 = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+fig_shap = plt.figure()
+shap.summary_plot(shap_class1, X_test_processed, feature_names=feature_names, show=False)
+st.pyplot(fig_shap)
+plt.close(fig_shap)
+
+mean_abs_shap = np.abs(shap_class1).mean(axis=0)
+importance = pd.DataFrame({"feature": feature_names, "importance": mean_abs_shap})
+importance = importance.sort_values("importance", ascending=False).head(5)
+
+st.markdown("**Key Drivers of Churn (SHAP)**")
+for _, row in importance.iterrows():
+    st.write(
+        f"- **{row['feature']}** shows a strong influence on churn predictions "
+        f"(mean |SHAP| = {row['importance']:.4f})."
+    )
+
+st.markdown(
+    """
+**Inference guidance:**
+- Higher positive SHAP values push the model toward predicting churn.
+- Negative SHAP values indicate factors that reduce churn risk.
+- Focus retention actions on the features with the largest mean |SHAP| values.
+"""
+)
